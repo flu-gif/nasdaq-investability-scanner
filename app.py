@@ -13,7 +13,7 @@ load_dotenv()
 API_KEY = os.getenv("APCA_API_KEY_ID")
 API_SECRET = os.getenv("APCA_API_SECRET_KEY")
 if not API_KEY or not API_SECRET:
-    raise SystemExit("Please set APCA_API_KEY_ID and APCA_API_SECRET_KEY in Railway Variables.")
+    raise SystemExit("Please set APCA_API_KEY_ID and APCA_API_SECRET_KEY in Render/Railway Variables.")
 
 # Optional Telegram (set both to enable)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -26,6 +26,13 @@ TRADING_BASE = os.getenv("ALPACA_TRADING_BASE", "https://paper-api.alpaca.market
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "100"))
 CACHE_SYMBOLS_HOURS = int(os.getenv("CACHE_SYMBOLS_HOURS", "24"))
+UNIVERSE_SIZE = int(os.getenv("UNIVERSE_SIZE", "1000"))         # NEW
+SCORE_MIN = int(os.getenv("SCORE_MIN", "60"))                    # NEW
+COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "120"))     # NEW (2 hours)
+# Momentum weighting: 1d > 4h > 1h (must sum to 1.0)
+W_1D = float(os.getenv("WEIGHT_1D", "0.6"))                      # NEW
+W_4H = float(os.getenv("WEIGHT_4H", "0.3"))                      # NEW
+W_1H = float(os.getenv("WEIGHT_1H", "0.1"))                      # NEW
 
 WINDOWS = {
     "1h": int(os.getenv("WINDOW_MINUTES_SHORT", "60")),
@@ -51,17 +58,23 @@ ET = ZoneInfo("America/New_York")
 OPEN_ET = dt.time(9, 30)   # 09:30
 H1_ET   = dt.time(10, 30)  # 10:30
 
+# Sector / market ETF basket (broad + industry)
+ETF_BASKET = ["QQQ","XLK","XLF","XLY","XLE","IBB","XBI","SMH","SOXX"]
+
 # ================== State ==================
 PriceSeries = Dict[str, Deque[Tuple[dt.datetime, float]]]
 VolSeries   = Dict[str, Deque[Tuple[dt.datetime, int]]]
 series: PriceSeries = defaultdict(lambda: deque(maxlen=max(WINDOWS.values()) + 600))
 vol_series: VolSeries = defaultdict(lambda: deque(maxlen=600))
-cooldowns = {}  # (symbol, window) -> last_sent_dt
+cooldowns = {}  # (symbol) -> last_sent_dt  (per-stock)
 last_returns = { "1h": {}, "4h": {}, "1d": {} }  # window -> {symbol: return_pct}
 recent_alerts: List[dict] = []  # trigger log (also in CSV)
 signals: Dict[str, dict] = defaultdict(dict)
 prev_close: Dict[str, float] = {}
-adv20: Dict[str, float] = {}  # 20-day average daily volume
+adv20: Dict[str, float] = {}            # 20-day average daily volume
+adv_dollar: Dict[str, float] = {}       # ADV$ = adv20 * prev_close
+ETF_RET_1D: Dict[str, float] = {}       # cached 1d returns for ETF basket
+ETF_RET_TS: float = 0.0
 
 # ================== Helpers ==================
 def now_utc() -> dt.datetime:
@@ -143,6 +156,12 @@ def fetch_prev_close_and_adv20(symbols: List[str]):
         except Exception as e:
             print("prev/adv20 batch error:", e)
         time.sleep(0.2)
+    # compute ADV$
+    for s in symbols:
+        pc = prev_close.get(s)
+        av = adv20.get(s)
+        if pc and av:
+            adv_dollar[s] = pc * av
 
 # ================== Feature Computations ==================
 def append_bar(sym: str, bar: dict):
@@ -249,21 +268,62 @@ def compute_rvol(sym: str) -> float:
     now_et = now_utc().astimezone(ET)
     start = dt.datetime.combine(now_et.date(), OPEN_ET, tzinfo=ET)
     end   = start + dt.timedelta(minutes=390)
-    frac = max(0.05, min(1.0), (now_et - start).total_seconds() / (end - start).total_seconds()) if now_et > start else 0.05
+    frac = 0.05
+    if now_et > start:
+        frac = max(0.05, min(1.0, (now_et - start).total_seconds() / (end - start).total_seconds()))
     est_full_day = intraday / frac
     return round(est_full_day / adv, 2)
 
+# -------- Sector context (ETF 1d returns; additive bonus) --------
+def refresh_etf_returns():
+    global ETF_RET_TS
+    now = time.time()
+    if now - ETF_RET_TS < 300 and ETF_RET_1D:  # cache 5 minutes
+        return
+    try:
+        bars = fetch_bars(ETF_BASKET, limit_per_symbol=2, timeframe="1Day")
+        for etf, blist in bars.items():
+            if len(blist) >= 2:
+                y = float(blist[-2]["c"]); t = float(blist[-1]["c"])
+                ETF_RET_1D[etf] = (t - y) / y * 100.0 if y > 0 else float("nan")
+        ETF_RET_TS = now
+    except Exception as e:
+        print("ETF returns fetch error:", e)
+
+def sector_bonus_for(bullish: bool) -> int:
+    """Additive bonus using the strongest ETF in our basket (no per-stock mapping needed)."""
+    refresh_etf_returns()
+    vals = [v for v in ETF_RET_1D.values() if not math.isnan(v)]
+    if not vals:
+        return 0
+    m = max(vals) if bullish else min(vals)
+    # Use QQQ/basket context: only give positive bonus for bullish alignment
+    if bullish:
+        if m > 0.8: return 15
+        if m > 0.3: return 8
+        return 0
+    else:
+        # for completeness; we don't alert on bearish anyway
+        if m < -0.5: return -8
+        return 0
+
 # ================== Scoring ==================
 def score_investability(sym: str, returns: dict, rvol: float, gap_pct: float, hold_pct: float, rsi: float, rsi_trend: str):
-    # Momentum score: best of windows vs thresholds
-    best = 0.0
-    for label, ret in returns.items():
-        th = THRESHOLDS[label]
-        if not math.isnan(ret) and th > 0:
-            best = max(best, min(2.0, abs(ret)/th))  # capped at 2x threshold
-    momentum_score = int(min(100, 50 + 25*best))  # at threshold ~75, at 2x ~100
+    """
+    Weighted momentum (1d>4h>1h) + volume + hold + RSI + sector bonus -> score 1..100 and longevity.
+    """
+    # Normalize weights
+    total_w = max(1e-9, W_1D + W_4H + W_1H)
+    w1d, w4h, w1h = W_1D/total_w, W_4H/total_w, W_1H/total_w
 
-    # Volume score via RVOL
+    # Only bullish momentum contributes
+    def ratio(label):
+        r = returns[label]; th = THRESHOLDS[label]
+        return max(0.0, min(2.0, (r/th) if (not math.isnan(r) and th>0) else 0.0))
+    m = w1d*ratio("1d") + w4h*ratio("4h") + w1h*ratio("1h")
+    momentum_score = int(min(100, 50 + 25*m))  # 0..2 -> 50..100
+
+    # Volume score (RVOL)
     if rvol and not math.isnan(rvol):
         if rvol < 0.8: vol_score = 20
         elif rvol < 1.0: vol_score = 40
@@ -271,7 +331,7 @@ def score_investability(sym: str, returns: dict, rvol: float, gap_pct: float, ho
         elif rvol < 2.5: vol_score = 80
         else: vol_score = 95
     else:
-        vol_score = 50  # neutral if unknown
+        vol_score = 50
 
     # First-hour hold & gap
     hold_score = 50
@@ -287,26 +347,26 @@ def score_investability(sym: str, returns: dict, rvol: float, gap_pct: float, ho
         elif gap_pct >= 1: gap_bonus = 2
         elif gap_pct <= -3: gap_bonus = -10
 
-    # RSI score
+    # RSI
     rsi_score = 50
     if not math.isnan(rsi):
-        if 55 <= rsi <= 80:
-            rsi_score = 75
-        elif rsi > 85:
-            rsi_score = 55
-        elif 45 <= rsi < 55:
-            rsi_score = 60
-        elif rsi < 40:
-            rsi_score = 30
+        if 55 <= rsi <= 80: rsi_score = 75
+        elif rsi > 85:      rsi_score = 55
+        elif 45 <= rsi < 55:rsi_score = 60
+        elif rsi < 40:      rsi_score = 30
     if rsi_trend == "rising": rsi_score += 10
     elif rsi_trend == "falling": rsi_score -= 10
     rsi_score = max(0, min(100, rsi_score))
+
+    # Additive sector bonus (bullish only)
+    bullish = (max(returns.get("1d",-1e9), returns.get("4h",-1e9), returns.get("1h",-1e9)) >= 0)
+    sector_bonus = sector_bonus_for(bullish)
 
     score = int(round(
         0.35*momentum_score +
         0.25*vol_score +
         0.20*hold_score +
-        0.20*rsi_score + gap_bonus
+        0.20*rsi_score + gap_bonus + sector_bonus
     ))
     score = max(1, min(100, score))
 
@@ -336,7 +396,15 @@ def log_alerts(rows: List[dict], log_file: str):
 
 def initial_load(symbols: List[str]):
     fetch_prev_close_and_adv20(symbols)
-    for batch in chunked(symbols, BATCH_SIZE):
+    # Reduce to top UNIVERSE_SIZE by ADV dollars
+    ranked = [(s, adv_dollar.get(s, 0.0)) for s in symbols]
+    ranked.sort(key=lambda x: x[1], reverse=True)
+    sel = [s for s,_ in ranked[:UNIVERSE_SIZE]]
+    save_cached_symbols(sel)
+    print(f"Universe limited to top {len(sel)} by ADV$.")
+
+    # Warm history for selected symbols
+    for batch in chunked(sel, BATCH_SIZE):
         try:
             bars = fetch_bars(batch, limit_per_symbol=120, timeframe="1Min")
             for sym, blist in bars.items():
@@ -360,15 +428,20 @@ def process_batch(batch_syms: List[str]):
         for label, r in ret_map.items():
             if not math.isnan(r): last_returns[label][sym] = round(r, 2)
 
-        # trigger
-        triggered = any(not math.isnan(r) and abs(r) >= THRESHOLDS[label] for label, r in ret_map.items())
+        # ---- TRIGGER: bullish only (no negative alerts) ----
+        bullish_trigger = (
+            (not math.isnan(ret_map["1h"]) and ret_map["1h"] >= THRESHOLDS["1h"]) or
+            (not math.isnan(ret_map["4h"]) and ret_map["4h"] >= THRESHOLDS["4h"]) or
+            (not math.isnan(ret_map["1d"]) and ret_map["1d"] >= THRESHOLDS["1d"])
+        )
 
-        if triggered:
+        if bullish_trigger:
             gap_pct, hold_pct = compute_gap_and_hold(sym)
             rsi, rsi_trend = compute_rsi_14(sym)
             rvol = compute_rvol(sym)
 
             score, longevity = score_investability(sym, ret_map, rvol, gap_pct, hold_pct, rsi, rsi_trend)
+            # store for dashboard regardless; alert only if score>=SCORE_MIN
             signals[sym] = {
                 "score": score, "longevity": longevity,
                 "ret_1h": round(ret_map["1h"],2) if not math.isnan(ret_map["1h"]) else None,
@@ -378,21 +451,25 @@ def process_batch(batch_syms: List[str]):
                 "rsi": rsi, "rsi_trend": rsi_trend, "asof": latest_ts.isoformat()
             }
 
-            key = (sym, "any")
-            last = cooldowns.get(key)
-            if last is None or (latest_ts - last) >= dt.timedelta(minutes=10):
-                cooldowns[key] = latest_ts
-                recent_alerts.append({
-                    "symbol": sym, "window": "any",
-                    "return_pct": max(abs(v) for v in [ret_map["1h"], ret_map["4h"], ret_map["1d"]] if not math.isnan(v)),
-                    "asof": latest_ts.isoformat()
-                })
-                if len(recent_alerts) > 200:
-                    del recent_alerts[:len(recent_alerts)-200]
-                msg = f"📈 {sym} score {score}/100, {longevity} | 1h:{ret_map['1h']:.2f}% 4h:{ret_map['4h']:.2f}% 1d:{ret_map['1d']:.2f}% RVOL:{rvol} RSI:{rsi}({rsi_trend})"
-                print("[ALERT]", msg)
-                send_telegram(msg)
-                to_log.append(recent_alerts[-1])
+            # Cooldown per stock
+            last = cooldowns.get(sym)
+            if (last is None) or ((latest_ts - last) >= dt.timedelta(minutes=COOLDOWN_MINUTES)):
+                if score >= SCORE_MIN:
+                    cooldowns[sym] = latest_ts
+                    maxret = max([v for v in [ret_map["1h"], ret_map["4h"], ret_map["1d"]] if not math.isnan(v)] or [0.0])
+                    recent_alerts.append({
+                        "symbol": sym, "window": "any",
+                        "return_pct": maxret,
+                        "asof": latest_ts.isoformat()
+                    })
+                    if len(recent_alerts) > 200:
+                        del recent_alerts[:len(recent_alerts)-200]
+                    # Emoji per score
+                    emoji = "🚀" if score >= 85 else "📈"
+                    msg = f"{emoji} {sym} score {score}/100, {longevity} | 1h:{ret_map['1h']:.2f}% 4h:{ret_map['4h']:.2f}% 1d:{ret_map['1d']:.2f}% RVOL:{rvol} RSI:{rsi}({rsi_trend})"
+                    print("[ALERT]", msg)
+                    send_telegram(msg)
+                    to_log.append(recent_alerts[-1])
     log_alerts(to_log, LOG_FILE)
 
 def run_scanner_forever():
@@ -403,10 +480,11 @@ def run_scanner_forever():
         if not symbols:
             print("Could not retrieve NASDAQ symbol list.")
             return
-        save_cached_symbols(symbols)
-
-    print(f"Tracking {len(symbols)} NASDAQ symbols.")
+    # Build initial state & reduce to top 1000 by ADV$
     initial_load(symbols)
+    # Reload reduced universe for polling
+    symbols = load_cached_symbols()
+    print(f"Tracking {len(symbols)} NASDAQ symbols (filtered).")
     print("Starting polling…")
 
     last_idx = 0
@@ -438,26 +516,23 @@ TEMPLATE = """
   <style>
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 20px; }
     h1, h2 { margin: 0.4em 0; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
     table { width: 100%; border-collapse: collapse; }
     th, td { padding: 8px; border-bottom: 1px solid #eee; text-align: left; }
-    .badge { padding: 2px 8px; border-radius: 999px; font-size: 12px; background: #eee; }
-    .pos { color: #0a7; font-weight: 600; }
-    .neg { color: #d33; font-weight: 600; }
-    a.button { display:inline-block; padding:8px 12px; border:1px solid #ddd; border-radius:6px; text-decoration:none; }
-    .bar { display:flex; gap:8px; align-items:center; margin: 10px 0 20px; flex-wrap: wrap;}
+    a.button { display:inline-block; padding:8px 12px; border:1px solid #ddd; border-radius:6px; text-decoration:none; margin-right:8px;}
     .muted { color:#666; font-size: 12px;}
     .score { font-weight: 700; }
+    .pos { color:#0a7; font-weight:600;}
+    .neg { color:#d33; font-weight:600;}
   </style>
   <meta http-equiv="refresh" content="30">
 </head>
 <body>
   <h1>📊 NASDAQ Investability Scanner</h1>
-  <div class="bar">
+  <div>
     <a class="button" href="/simulate">Simulate now (no waiting)</a>
     <a class="button" href="/test">Telegram test</a>
     <a class="button" href="/health">Health</a>
-    <span class="muted">Auto-refresh every 30s | Delayed data is OK for multi-hour/day signals</span>
+    <span class="muted">Auto-refresh every 30s | Universe: top {{univ}} by ADV$ | Score filter ≥ {{score_min}} | Cooldown {{cooldown}} min</span>
   </div>
 
   <h2>Triggered (ranked by score)</h2>
@@ -494,7 +569,7 @@ TEMPLATE = """
 
   <h2>Recent triggers</h2>
   <table>
-    <thead><tr><th>Time (UTC)</th><th>Symbol</th><th>Max |Δ%|</th></tr></thead>
+    <thead><tr><th>Time (UTC)</th><th>Symbol</th><th>Max +Δ%</th></tr></thead>
     <tbody>
       {% for a in alerts %}
         <tr><td>{{ a.asof }}</td><td>{{ a.symbol }}</td><td>{{ '%.2f'|format(a.return_pct) }}%</td></tr>
@@ -523,7 +598,8 @@ def home():
     alert_rows = []
     for x in alerts:
         a = A(); a.symbol=x["symbol"]; a.return_pct=x["return_pct"]; a.asof=x["asof"]; alert_rows.append(a)
-    return render_template_string(TEMPLATE, ranked=ranked, alerts=alert_rows)
+    return render_template_string(TEMPLATE, ranked=ranked, alerts=alert_rows,
+                                  univ=UNIVERSE_SIZE, score_min=SCORE_MIN, cooldown=COOLDOWN_MINUTES)
 
 @app.route("/test")
 def test():

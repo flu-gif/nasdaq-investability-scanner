@@ -121,15 +121,24 @@ def send_telegram(text: str):
 
 # ================== Alpaca API ==================
 def fetch_nasdaq_symbols() -> List[str]:
+    """List active NASDAQ US equities only (no crypto pairs)."""
     url = f"{TRADING_BASE}/assets"
-    params = {"status": "active", "exchange": "NASDAQ"}
+    params = {"status": "active"}  # we'll filter ourselves
     out = []
     r = requests.get(url, headers=HEADERS, params=params, timeout=60)
     r.raise_for_status()
     for a in r.json():
-        sym = a.get("symbol")
-        if sym and a.get("tradable", True):
-            out.append(sym)
+        # Keep ONLY US equities on NASDAQ, tradable, and no "/" in symbol
+        if a.get("asset_class") != "us_equity":
+            continue
+        if a.get("exchange") != "NASDAQ":
+            continue
+        if not a.get("tradable", True):
+            continue
+        sym = (a.get("symbol") or "").strip()
+        if not sym or "/" in sym:
+            continue
+        out.append(sym)
     return sorted(set(out))
 
 def fetch_bars(symbols: List[str], limit_per_symbol: int, timeframe="1Min"):
@@ -396,6 +405,7 @@ def log_alerts(rows: List[dict], log_file: str):
 
 def initial_load(symbols: List[str]):
     fetch_prev_close_and_adv20(symbols)
+    symbols = [s for s in symbols if s and "/" not in s]
     # Reduce to top UNIVERSE_SIZE by ADV dollars
     ranked = [(s, adv_dollar.get(s, 0.0)) for s in symbols]
     ranked.sort(key=lambda x: x[1], reverse=True)

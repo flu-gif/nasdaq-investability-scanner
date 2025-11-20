@@ -441,6 +441,63 @@ def score_investability(sym: str, ret_map: dict, rvol: float, gap: float, hold: 
 
     return score, longevity
 
+def safe_is_nan(x):
+    return isinstance(x, float) and math.isnan(x)
+
+def rvol_label(rvol: float) -> str:
+    if rvol is None or safe_is_nan(rvol):
+        return "no volume data"
+    if rvol < 0.8:
+        return "very low (weak interest)"
+    if rvol < 1.0:
+        return "below avg (meh)"
+    if rvol < 1.5:
+        return "normal to good"
+    if rvol < 2.5:
+        return "high (strong interest)"
+    return "very high (aggressive volume)"
+
+def gap_label(gap: float) -> str:
+    if gap is None or safe_is_nan(gap):
+        return "no gap data"
+    if gap < -3:
+        return "big negative gap"
+    if gap < 0:
+        return "small negative gap"
+    if gap < 1:
+        return "flat open"
+    if gap < 3:
+        return "positive gap"
+    return "big positive gap"
+
+def hold_label(hold: float) -> str:
+    if hold is None or safe_is_nan(hold):
+        return "no hold data"
+    if hold < 0:
+        return "fading after open"
+    if hold < 2:
+        return "weak hold"
+    if hold < 5:
+        return "decent hold"
+    if hold < 8:
+        return "strong hold"
+    return "very strong hold"
+
+def rsi_label(rsi: float) -> str:
+    if rsi is None or safe_is_nan(rsi):
+        return "no rsi data"
+    if rsi < 30:
+        return "oversold area"
+    if rsi < 45:
+        return "weak / cooling"
+    if rsi < 55:
+        return "neutral"
+    if rsi < 70:
+        return "bullish momentum"
+    if rsi < 80:
+        return "strong bullish / hot"
+    return "very hot / overbought"
+
 
 # ======================================================
 #  SCANNER LOOP (MAIN ENGINE)
@@ -513,12 +570,20 @@ def run_scanner():
             r4 = compute_return_pct(sym, WINDOWS["4h"])
             r1d = compute_return_pct(sym, WINDOWS["1d"])
 
+            # NEW: ignore any stock that is DOWN on the day
+            if math.isnan(r1d) or r1d <= 0:
+                continue
+
             ret_map = {"1h": r1, "4h": r4, "1d": r1d}
 
-            # Trigger only if bullish
-            bullish = any(not math.isnan(ret_map[w]) and ret_map[w] >= THRESHOLDS[w] for w in WINDOWS)
+            # Trigger only if bullish AND positive on the day
+            bullish = any(
+                not math.isnan(ret_map[w]) and ret_map[w] >= THRESHOLDS[w]
+                for w in WINDOWS
+            )
             if not bullish:
                 continue
+
 
             # Additional indicators
             gap, hold = compute_gap_and_hold(sym)
@@ -563,6 +628,8 @@ def run_scanner():
         sleep_time = max(1, REFRESH_INTERVAL - elapsed)
         time.sleep(sleep_time)
 # ======================================================
+
+
 #  TELEGRAM COMMAND LISTENER
 # ======================================================
 
@@ -618,6 +685,7 @@ def telegram_command_listener():
                 continue
 
             # /signal
+            # /signal SYMBOL
             if tl.startswith("/signal"):
                 parts = text.split()
                 if len(parts) != 2:
@@ -643,16 +711,34 @@ def telegram_command_listener():
                     rvol, gap, hold, rsi, rsi_trend
                 )
 
+                # Graceful formatting for NaN values
+                def fmt_pct(x):
+                    if x is None or safe_is_nan(x):
+                        return "N/A"
+                    return f"{x:.2f}%"
+
+                def fmt_num(x):
+                    if x is None or safe_is_nan(x):
+                        return "N/A"
+                    return f"{x:.2f}"
+
+                rvol_str = fmt_num(rvol)
+                gap_str = fmt_pct(gap)
+                hold_str = fmt_pct(hold)
+                rsi_str = fmt_num(rsi)
+
                 msg = (
                     f"{sym} metrics:\n"
-                    f"Score {score} ({longevity})\n"
-                    f"1h:{r1:.2f}% 4h:{r4:.2f}% 1d:{r1d:.2f}%\n"
-                    f"RVOL:{rvol:.2f}\n"
-                    f"Gap:{gap:.2f}% Hold:{hold:.2f}%\n"
-                    f"RSI:{rsi:.2f} (trend:{rsi_trend})"
+                    f"Score: {score} ({longevity})\n"
+                    f"1h: {fmt_pct(r1)}  |  4h: {fmt_pct(r4)}  |  1d: {fmt_pct(r1d)}\n"
+                    f"RVOL: {rvol_str}  → {rvol_label(rvol)}\n"
+                    f"Gap:  {gap_str}   → {gap_label(gap)}\n"
+                    f"Hold: {hold_str}  → {hold_label(hold)}\n"
+                    f"RSI:  {rsi_str}   → {rsi_label(rsi)} (trend: {rsi_trend})"
                 )
                 send_telegram(msg)
                 continue
+
 
             # /top
             if tl == "/top":
@@ -664,12 +750,14 @@ def telegram_command_listener():
                     r1 = compute_return_pct(sym, WINDOWS["1h"])
                     r4 = compute_return_pct(sym, WINDOWS["4h"])
                     r1d = compute_return_pct(sym, WINDOWS["1d"])
+
+                    # NEW: only show stocks that are UP on the day
+                    if math.isnan(r1d) or r1d <= 0:
+                        continue
+
                     rvol = compute_rvol(sym)
                     gap, hold = compute_gap_and_hold(sym)
                     rsi, rsi_trend = compute_rsi_14(sym)
-
-                    if math.isnan(r1d):
-                        continue
 
                     score, lon = score_investability(
                         sym,
